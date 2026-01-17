@@ -9,6 +9,7 @@ OSF: https://osf.io/r4efm/overview
 - vacc_cog_res.csv - results of vaccination analysis on cognitive data  
 - time_since_inf_models.csv - results of time since infection analysis on cognitive data  
 - IMG_allResults.csv - results of main models with imaging IDPs  
-- res_img_vaccination.csv - results of vaccination models on imaging IDPs  
+- res_img_vaccination.csv - results of vaccination models on imaging IDPs
+- time_since_inf_img.csv - results of time since infection analysis for imaging IDPs
   
 
