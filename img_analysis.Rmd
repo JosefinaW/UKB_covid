@@ -1,0 +1,1250 @@
+---
+title: "imagingIDPs_analysis"
+author: "Josefina Weinerova"
+date: "2025-05-20"
+output: html_document
+---
+terminal - file download
+dx download C19_imaging_participant.csv
+dx download control_imaging_participant.csv
+dx download control2_img_p2_participant.csv
+dx download C19_img_p2_participant.csv
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# packages loading
+```{r, echo=FALSE,message=FALSE,warning=FALSE,results=FALSE} 
+if (!require(pacman)) install.packages("pacman")
+
+pacman::p_load(knitr, ggpubr, nortest, phia, lubridate, parameters, rlang, ggplot2, tidyverse, data.table, rmarkdown, GGally, tidyr, ggrepel, gridExtra, lme4, lmerTest, Rmisc, plotrix, datawizard, cowplot, emmeans, broom.mixed, easystats,patchwork)
+``` 
+# colour palette
+```{r,results=FALSE}
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+# # To use for fills, add
+#   scale_fill_manual(values=cbPalette)
+#
+# # To use for line and point colors, add
+#   scale_colour_manual(values=cbPalette)
+```
+#data download
+```{r}
+covid_img <- read_csv("C19_imaging_participant.csv")
+covid_img2 <- read_csv("C19_img_p2_participant.csv")
+control2_img <- read_csv("control_imaging_participant.csv")
+control2_img2 <- read_csv("control2_img_p2_participant.csv")
+colnames(covid_img)[1] <- c("Participants.ID")
+colnames(covid_img2)[1] <- c("Participants.ID")
+colnames(control2_img)[1] <- c("Participants.ID")
+colnames(control2_img2)[1] <- c("Participants.ID")
+covid_img <- merge(covid_img, covid_img2, by = "Participants.ID")
+control2_img <- merge(control2_img, control2_img2, by = "Participants.ID")
+data_img <- rbind(covid_img, control2_img)
+```
+
+# Removing outliers
+```{r}
+data_img_noout <- data_img
+# Find all column names ending in _i2 and _i3
+i2_cols <- names(data_img_noout)[str_detect(names(data_img_noout), "_i2$")]
+i3_cols <- names(data_img_noout)[str_detect(names(data_img_noout), "_i3$")]
+
+# Extract the root variable names
+roots_i2 <- str_remove(i2_cols, "_i2$")
+roots_i3 <- str_remove(i3_cols, "_i3$")
+
+# Get only roots that have both _i2 and _i3 columns
+common_roots <- intersect(roots_i2, roots_i3)
+
+# For each root, create a _dif column
+for (root in common_roots) {
+  col_i2 <- paste0(root, "_i2")
+  col_i3 <- paste0(root, "_i3")
+  col_dif <- paste0(root, "_dif")
+
+  data_img_noout[[col_dif]] <- data_img_noout[[col_i3]] - data_img_noout[[col_i2]]
+}
+
+col_difIM <- names(data_img_noout)[str_ends(names(data_img_noout), "_dif")]
+```
+
+# applying outlier removal
+```{r}
+# how many NAs were there prior to outlier removal (tracking how many data points were removed)
+na_prior <- colSums(is.na(data_img_noout))
+
+colSums(!is.na(data_img_noout)) # calculating numbers prior to outlier removal for each task
+
+# removing outliers
+outliers <- function(variable) {
+  iqr <- IQR(variable, na.rm = TRUE)
+  Q <- quantile(variable, probs = c(.25, .75), na.rm = TRUE)
+  mild_low <- Q[1] - (3 * iqr)
+  mild_high <- Q[2] + (3 * iqr)
+  new_variable <- ifelse(variable < mild_low | variable > mild_high, NA, variable)
+  return(new_variable)
+}
+
+# removing outliers
+data_img_noout[col_difIM] <- sapply(data_img_noout[col_difIM], outliers) # applying outlier removal
+
+# how many data points removed per variable
+na_post <- colSums(is.na(data_img_noout))
+
+na_prior - na_post
+```
+
+```{r}
+# Loop over each task and replace T1 and T2 with NA where the difference is NA
+
+# Step 1: Get all _dif columns
+dif_cols <- names(data_img_noout)[str_ends(names(data_img_noout), "_dif")]
+
+# Step 2: Loop over each _dif column and apply the rule
+for (dif_col in dif_cols) {
+  root <- str_remove(dif_col, "_dif$")
+  col_i2 <- paste0(root, "_i2")
+  col_i3 <- paste0(root, "_i3")
+
+  # Only do this if both _i2 and _i3 columns exist
+  if (all(c(col_i2, col_i3) %in% names(data_img_noout))) {
+    data_img_noout[[col_i2]][is.na(data_img_noout[[dif_col]])] <- NA
+    data_img_noout[[col_i3]][is.na(data_img_noout[[dif_col]])] <- NA
+  }
+}
+```
+# which variables did not have 2 columns
+```{r}
+# checking which outcomes were not in common - turns out not all of them are on the prereg list (errors when collating data together on UKB RAP)
+uncommon_roots1 <- setdiff(roots_i2, roots_i3)
+uncommon_roots2 <- setdiff(roots_i3, roots_i2)
+```
+# dataset with all data
+```{r}
+data_all <- merge(data_noout, data_img_noout, by = "Participants.ID")
+```
+
+# automated analysis - run lmer models for all variables
+```{r}
+data_all$CovidGroup <- factor(data_all$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+results_list <- list()
+
+for (var in common_roots) {
+  # Define column names for the two time points
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+
+  # Skip if one of the time points is missing
+  if (!all(c(col_i2, col_i3) %in% names(data_all))) next
+
+  print(var)
+  # scale
+  # Create scaled versions of each column
+  col_i2_scaled <- paste0(var, "_i2s")
+  col_i3_scaled <- paste0(var, "_i3s")
+
+  data_all[[col_i2]] <- scale(data_all[[col_i2]], center = TRUE, scale = TRUE)
+  data_all[[col_i3]] <- scale(data_all[[col_i3]], center = TRUE, scale = TRUE)
+  # Pivot just the two time points to long
+  long_df <- data_all %>%
+    select(Participants.ID, Site2, CovidGroup, Month_dif, Month_dif_sq, Age2_sc, Sex, Town_sc, Ethnic2, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3")) # Ensures treatment contrast works
+
+  # Fit model
+  model <- lmer(
+    score ~ CovidGroup + instance + CovidGroup:instance +
+      Month_dif + Month_dif_sq + Age2_sc + Sex + Town_sc + Ethnic2 +
+      (1 | Participants.ID) + (1 | Site2),
+    data = long_df
+  )
+
+  # Store tidy results with variable name
+  tidy_res <- broom.mixed::tidy(model) %>%
+    mutate(variable = var)
+
+  results_list[[var]] <- tidy_res
+  plot(resid(model))
+}
+```
+
+
+#save the output
+```{r}
+img_main_results <- results_list
+```
+# Variables with singularity problems in the model
+```{r}
+# extra <- c("p25386","p25905", "p25850","p25851","p25841","p25800","p26518","p25127","p25126", "p25121","p25120", "p25107", "p25139","p25138","p25141", "p25140", "p25137","p25136", "p25106", "p25131", "p25130", "p25123", "p25122", "p25133", "p25132","p25108", "p25129", "p25128", "p25144", "p25148","p25078")
+
+extra <- c("p26585", "p25905", "p25886", "p25850", "p25799", "p26557", "p25123", "p25085")
+data_all$CovidGroup <- factor(data_all$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+results_list2 <- list()
+for (var in extra) {
+  # Define column names for the two time points
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+
+  # Skip if one of the time points is missing
+  if (!all(c(col_i2, col_i3) %in% names(data_all))) next
+
+  print(var)
+
+
+  data_all[[col_i2]] <- scale(data_all[[col_i2]], center = TRUE, scale = TRUE)
+  data_all[[col_i3]] <- scale(data_all[[col_i3]], center = TRUE, scale = TRUE)
+
+  # Pivot the scaled columns
+  data_extra <- data_all %>%
+    select(
+      Participants.ID, CovidGroup, Month_dif, Month_dif_sq, Age2_sc, Sex, Town_sc, Ethnic2,
+      all_of(c(col_i2, col_i3))
+    ) %>%
+    pivot_longer(
+      cols = all_of(c(col_i2, col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3"))
+  # Fit model
+  model_extra <- lmerTest::lmer(
+    score ~ CovidGroup + instance + CovidGroup:instance +
+      Month_dif + Month_dif_sq + Age2_sc + Sex + Town_sc + Ethnic2 +
+      (1 | Participants.ID),
+    data = data_extra
+  )
+
+  # Store tidy results with variable name
+  tidy_res <- broom.mixed::tidy(model_extra) %>%
+    mutate(variable = var)
+
+  results_list2[[var]] <- tidy_res
+  plot(resid(model_extra))
+}
+results_list2
+```
+
+
+# putting the two results lists together
+```{r}
+# need to remove results for models that are in results_list2 from results list
+length(results_list)
+length(results_list2)
+results_list_filtered <- results_list[setdiff(names(results_list), names(results_list2))]
+length(results_list_filtered)
+
+results_img <- append(results_list_filtered, results_list2)
+results_img <- bind_rows(results_img)
+
+results_img <- results_img %>% filter(is.na(group))
+```
+#correction for multiple comparisons
+```{r}
+# Apply p.adjust
+pval_img_fdr <- results_img %>%
+  mutate(p_fdr = p.adjust(p.value, method = "fdr")) %>%
+  ungroup()
+
+all_res_img <- pval_img_fdr
+# which p-values remain significant
+img_sig <- pval_img_fdr %>%
+  filter(p_fdr <= 0.05) %>%
+  filter(str_starts(term, "CovidGroupControl"))
+codes <- read_csv("direrepl_codes.csv")
+codes$IDs <- paste0("p", codes$IDs)
+sig_dirrep <- img_sig %>% filter(variable %in% codes$IDs)
+
+sig_dirrep <- merge(sig_dirrep, codes, by.x = "variable", by.y = "IDs")
+# write.csv(sig_dirrep,"img_DR_res.csv")
+
+pval_img_fdr %>%
+  filter(p_fdr <= 0.05) %>%
+  filter(str_starts(term, "CovidGroupControl"))
+```
+#plot the significant ones - removing intersubject variability
+```{r}
+codes_dep <- codes %>% dplyr::select(`Dependent variable`, IDs)
+colnames(codes_dep) <- c("DV", "variable")
+dirrep_ids <- data.frame(variable = sig_dirrep$variable)
+dirrep_ids <- left_join(dirrep_ids, codes_dep, by = "variable")
+dirrep_ids <- distinct(dirrep_ids)
+plot_list <- list()
+for (i in seq_len(nrow(dirrep_ids))) {
+  var <- dirrep_ids$variable[i]
+  label <- dirrep_ids$DV[i]
+
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+
+  long_data <- data_all %>%
+    select(Participants.ID, CovidGroup, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3"))
+
+  long_data$instance <- as.factor(long_data$instance)
+  dfwc <- summarySEwithin(long_data, measurevar = "score", withinvars = "instance", betweenvars = "CovidGroup", idvar = "Participants.ID", na.rm = TRUE, conf.interval = .95)
+
+  dfwc$CovidGroup <- factor(dfwc$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+
+  p <- ggplot(dfwc, aes(x = instance, y = score, group = CovidGroup, color = CovidGroup)) +
+    geom_point(size = 4) +
+    geom_line(size = 2) +
+    geom_errorbar(aes(ymin = score - se, ymax = score + se), width = .1, size = 2) +
+    theme_bw() +
+    labs(title = label, y = "within-subject adjusted IDP value", x = "instance") +
+    theme_cowplot(12) +
+    theme(
+      plot.title = element_blank(),
+      axis.title = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 19),
+      axis.text.y = element_text(size = 19),
+      legend.title = element_text(size = 18, face = "bold"),
+      legend.text = element_text(size = 17),
+      strip.text = element_text(size = 18)
+    ) +
+    scale_x_discrete(labels = c("T1", "T2")) +
+    scale_color_manual(values = c("#E69F00", "#999999", "#56B4E9"), labels = c("Covid", "Control 1", "Control 2"), name = "Group")
+
+  print(p)
+  plot_list[[label]] <- p
+}
+```
+
+
+# correlation between the direct replication significant variables
+```{r}
+cor_ids <- c("p25905_i2", "p25905_i3", "p26515_i2", "p26515_i3", "p26516_i2", "p26516_i3", "p26520_i2", "p26520_i3", "p26585_i2", "p26585_i3", "p27183_i2", "p27183_i3")
+
+cor_df <- data_all %>% dplyr::select(all_of(cor_ids)) 
+
+cor(cor_df, method = "pearson", use = "complete.obs")
+```
+
+# redo the model for when Control 2 is reference group
+```{r}
+data_all$CovidGroup <- factor(data_all$CovidGroup, levels = c("Control2", "Covid", "Control1"))
+results_listC2 <- list()
+
+for (var in common_roots) {
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+  # Skip if one of the time points is missing
+  if (!all(c(col_i2, col_i3) %in% names(data_all))) next
+  print(var)
+  # scale
+  # Pivot just the two time points to long
+  long_df <- data_all %>%
+    select(Participants.ID, Site2, CovidGroup, Month_dif, Month_dif_sq, Age2_sc, Sex, Town_sc, Ethnic2, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3")) # Ensures treatment contrast works
+
+  # Fit model
+  model <- lmer(
+    score ~ CovidGroup + instance + CovidGroup:instance +
+      Month_dif + Month_dif_sq + Age2_sc + Sex + Town_sc + Ethnic2 +
+      (1 | Participants.ID) + (1 | Site2),
+    data = long_df
+  )
+
+  # Store tidy results with variable name
+  tidy_res <- broom.mixed::tidy(model) %>%
+    mutate(variable = var)
+
+  results_listC2[[var]] <- tidy_res
+  plot(resid(model))
+}
+results_listC2
+```
+# for variables with convergence issues
+```{r}
+extra <- c("p26585", "p25905", "p25888", "p25886", "p25850", "p25799", "p25800", "p26557", "p25123", "p25085", "p25101")
+data_all$CovidGroup <- factor(data_all$CovidGroup, levels = c("Control2", "Covid", "Control1"))
+results_list2C2 <- list()
+for (var in extra) {
+  # Define column names for the two time points
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+
+  # Skip if one of the time points is missing
+  if (!all(c(col_i2, col_i3) %in% names(data_all))) next
+
+  print(var)
+
+  # Pivot the scaled columns
+  data_extra <- data_all %>%
+    select(
+      Participants.ID, CovidGroup, Month_dif, Month_dif_sq, Age2_sc, Sex, Town_sc, Ethnic2,
+      all_of(c(col_i2, col_i3))
+    ) %>%
+    pivot_longer(
+      cols = all_of(c(col_i2, col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3"))
+  # Fit model
+  model_extra <- lmerTest::lmer(
+    score ~ CovidGroup + instance + CovidGroup:instance +
+      Month_dif + Month_dif_sq + Age2_sc + Sex + Town_sc + Ethnic2 +
+      (1 | Participants.ID),
+    data = data_extra
+  )
+
+  # Store tidy results with variable name
+  tidy_res <- broom.mixed::tidy(model_extra) %>%
+    mutate(variable = var)
+
+  results_list2C2[[var]] <- tidy_res
+  plot(resid(model_extra))
+}
+results_list2C2
+```
+
+```{r}
+# need to remove results for models that are in results_list2 from results list
+results_list_filteredC2 <- results_listC2[setdiff(names(results_listC2), names(results_list2C2))]
+length(results_list_filteredC2)
+
+results_imgC2 <- append(results_list_filteredC2, results_list2C2)
+results_imgC2 <- bind_rows(results_imgC2)
+
+results_imgC2 <- results_imgC2 %>% filter(is.na(group))
+```
+
+#correction for multiple comparisons for the flipped model
+```{r}
+# Apply p.adjust
+pval_img_fdrC2 <- results_imgC2 %>%
+  mutate(p_fdr = p.adjust(p.value, method = "fdr")) %>%
+  ungroup()
+
+
+# which p-values remain significant
+img_sigC2 <- pval_img_fdrC2 %>%
+  filter(p_fdr <= 0.05) %>%
+  filter(str_starts(term, "CovidGroup"))
+sig_dirrepC2 <- img_sigC2 %>% filter(variable %in% codes$IDs)
+
+sig_dirrepC2 <- merge(sig_dirrepC2, codes, by.x = "variable", by.y = "IDs")
+
+View(sig_dirrepC2)
+```
+
+#looking at results for conceptual replication in structural MRI
+```{r}
+# which p-values remain significant
+codesMRI <- read_csv("structuralMRI_codes.csv")
+codesMRI <- codesMRI %>% separate(IDs, into = c("Left", "Right"), sep = ",")
+codesMRI <- codesMRI %>% pivot_longer(cols = c(Left, Right), names_to = "side", values_to = "variable")
+codesMRI$variable <- paste0("p", codesMRI$variable)
+# for diff MRI
+codesdMRI <- read_csv("diffMRI_codes.csv")
+codesdMRI <- codesdMRI %>% pivot_longer(cols = c(`Mean MD IDs`, `Mean FA IDs`), names_to = "measure", values_to = "variable")
+codesdMRI <- codesdMRI %>% separate(variable, into = c("Left", "Right"), sep = ",")
+codesdMRI <- codesdMRI %>% pivot_longer(cols = c(Left, Right), names_to = "side", values_to = "variable")
+codesdMRI$variable <- paste0("p", codesdMRI$variable)
+
+sig_MRI <- img_sig %>% filter(variable %in% codesMRI$variable)
+sig_dMRI <- img_sig %>% filter(variable %in% codesdMRI$variable)
+
+sig_MRI <- merge(sig_MRI, codesMRI, by = "variable")
+# write.csv(sig_MRI,"img_MRI_res.csv")
+
+sig_dMRI <- merge(sig_dMRI, codesdMRI, by = "variable")
+# write.csv(sig_dMRI, "img_dMRI_res.csv")
+```
+
+# plots for structural MRI
+-plot the significant ones
+```{r}
+codes_plot <- sig_MRI %>% dplyr::select(`Dependent variable`, variable)
+colnames(codes_plot) <- c("DV", "variable")
+codes_plot <- distinct(codes_plot)
+codes_plot$variable <- gsub(" ", "", codes_plot$variable)
+plot_list <- list()
+for (i in seq_len(nrow(codes_plot))) {
+  var <- codes_plot$variable[i]
+  label <- codes_plot$DV[i]
+
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+  long_data <- data_all %>%
+    select(Participants.ID, CovidGroup, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3"))
+
+  long_data$instance <- as.factor(long_data$instance)
+  dfwc <- summarySEwithin(long_data, measurevar = "score", withinvars = "instance", betweenvars = "CovidGroup", idvar = "Participants.ID", na.rm = TRUE, conf.interval = .95)
+
+  dfwc$CovidGroup <- factor(dfwc$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+
+  p <- ggplot(dfwc, aes(x = instance, y = score, group = CovidGroup, color = CovidGroup)) +
+    geom_point(size = 4) +
+    geom_line(size = 2) +
+    geom_errorbar(aes(ymin = score - se, ymax = score + se), width = .1, size = 2) +
+    theme_bw() +
+    labs(title = label, y = "within-subject adjusted IDP value", x = "instance") +
+    theme_cowplot(12) +
+    theme(
+      plot.title = element_blank(),
+      axis.title = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 19),
+      axis.text.y = element_text(size = 19),
+      legend.title = element_text(size = 18, face = "bold"),
+      legend.text = element_text(size = 17),
+      strip.text = element_text(size = 18)
+    ) +
+    scale_x_discrete(labels = c("T1", "T2")) +
+    scale_color_manual(values = c("#E69F00", "#999999", "#56B4E9"), labels = c("Covid", "Control 1", "Control 2"), name = "Group")
+
+  print(p)
+  plot_list[[label]] <- p
+}
+
+
+plot_list
+
+# --- Save all plots ---
+out_dir <- "plots_out"
+dir.create(out_dir, showWarnings = FALSE)
+
+for (nm in names(plot_list)) {
+  file_stub <- gsub("\\s+", "", nm) # remove spaces
+  outfile <- file.path(out_dir, paste0(file_stub, ".png"))
+
+  ggsave(
+    filename = outfile,
+    plot     = plot_list[[nm]],
+    width    = 9,
+    height   = 6,
+    units    = "in", # exact pixels
+    dpi      = 300,
+    bg       = "white" # avoid transparent backgrounds
+    # device = ragg::agg_png  # <- uncomment if you use {ragg} for crisper text
+  )
+}
+```
+
+#structural MRI IDPs difference between control groups
+```{r}
+sig_dirrepC2 <- img_sigC2 %>% filter(variable %in% codesMRI$variable)
+
+sig_dirrepC2 <- merge(sig_dirrepC2, codesMRI, by = "variable")
+
+View(img)
+```
+
+#diffusion MRI IDPs significant results for difference between control groups
+```{r}
+sig_dMRIC2 <- img_sigC2 %>% filter(variable %in% codesdMRI$variable)
+sig_dMRIC2 <- merge(sig_dMRIC2, codesdMRI, by = "variable")
+
+View(sig_dMRIC2)
+
+# same <- sig_dMRIC2[]
+# different
+```
+# plot diffusion variables
+```{r}
+codes_plot <- sig_dMRI %>% dplyr::select(`Dependent variable`, variable, side, measure)
+codes_plot <- codes_plot %>% mutate(measure_type = ifelse(str_starts(measure, "Mean FA"), "FA", "MD"))
+codes_plot <- codes_plot %>% mutate(DV = paste(`Dependent variable`, side, measure_type, sep = " | "))
+codes_plot <- distinct(codes_plot)
+codes_plot$variable <- gsub(" ", "", codes_plot$variable)
+plot_list <- list()
+for (i in seq_len(nrow(codes_plot))) {
+  var <- codes_plot$variable[i]
+  label <- codes_plot$DV[i]
+
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+  long_data <- data_all %>%
+    select(Participants.ID, CovidGroup, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3"))
+
+  long_data$instance <- as.factor(long_data$instance)
+  dfwc <- summarySEwithin(long_data, measurevar = "score", withinvars = "instance", betweenvars = "CovidGroup", idvar = "Participants.ID", na.rm = TRUE, conf.interval = .95)
+
+  dfwc$CovidGroup <- factor(dfwc$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+
+  p <- ggplot(dfwc, aes(x = instance, y = score, group = CovidGroup, color = CovidGroup)) +
+    geom_point(size = 4) +
+    geom_line(size = 2) +
+    geom_errorbar(aes(ymin = score - se, ymax = score + se), width = .1, size = 2) +
+    theme_bw() +
+    labs(title = label, y = "within-subject adjusted IDP value", x = "instance") +
+    theme_cowplot(12) +
+    theme(
+      plot.title = element_text(size = 18, face = "bold"),
+      axis.title = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 19),
+      axis.text.y = element_text(size = 19),
+      legend.title = element_text(size = 18, face = "bold"),
+      legend.text = element_text(size = 17),
+      strip.text = element_text(size = 18)
+    ) +
+    scale_x_discrete(labels = c("T1", "T2")) +
+    scale_color_manual(values = c("#E69F00", "#999999", "#56B4E9"), labels = c("Covid", "Control 1", "Control 2"), name = "Group")
+
+  print(p)
+  plot_list[[label]] <- p
+}
+
+
+plot_list
+```
+
+# plot diffusion as boxplots plots
+```{r}
+codes_plot <- sig_dMRI %>% dplyr::select(`Dependent variable`, variable, side, measure)
+codes_plot <- codes_plot %>% mutate(measure_type = ifelse(str_starts(measure, "Mean FA"), "FA", "MD"))
+codes_plot <- codes_plot %>% mutate(DV = paste(`Dependent variable`, side, measure_type, sep = " | "))
+codes_plot <- distinct(codes_plot)
+codes_plot$variable <- gsub(" ", "", codes_plot$variable)
+plot_list <- list()
+for (i in seq_len(nrow(codes_plot))) {
+  var <- codes_plot$variable[i]
+  label <- codes_plot$DV[i]
+
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+
+  # Long-format raw data
+  long_data <- data_all %>%
+    select(Participants.ID, CovidGroup, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3"))
+
+  long_data$instance <- factor(long_data$instance, levels = c("i2", "i3"))
+  long_data$CovidGroup <- factor(long_data$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+
+  # dfwc <- summarySEwithin(long_data, measurevar="score", withinvars="instance", betweenvars = "CovidGroup", idvar="Participants.ID", na.rm=TRUE, conf.interval=.95)
+  # geom_point(data = dfwc,
+  #              aes(x = instance, y = score, group = CovidGroup),colour="black",
+  #              position = position_dodge(width = 0.75),
+  #              size = 2)
+
+  dfwc$CovidGroup <- factor(dfwc$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+  # Plot: Boxplot + Adjusted Means + Error Bars
+  p <- ggplot() +
+    geom_boxplot(
+      data = long_data,
+      aes(x = instance, y = score, fill = CovidGroup),
+      position = position_dodge(width = 0.75)
+    ) +
+    theme_bw() +
+    labs(title = label, y = "IDP value", x = "Timepoint (instance)") +
+    theme_cowplot(12) +
+    theme(
+      plot.title = element_text(size = 18, face = "bold"),
+      axis.title = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 19),
+      axis.text.y = element_text(size = 19),
+      legend.title = element_text(size = 18, face = "bold"),
+      legend.text = element_text(size = 17),
+      strip.text = element_text(size = 18)
+    ) +
+    scale_x_discrete(labels = c("T1", "T2")) +
+    scale_fill_manual(
+      values = c("#E69F00", "#999999", "#56B4E9"),
+      labels = c("Covid", "Control 1", "Control 2")
+    )
+
+  print(p)
+  plot_list[[label]] <- p
+}
+```
+# combine plots for supplementary material figures
+```{r}
+# Combine all plots in plot_list into a grid with 2 plots per row
+big_plot1 <- wrap_plots(plot_list[1:6], ncol = 2)
+big_plot2 <- wrap_plots(plot_list[7:12], ncol = 2)
+big_plot3 <- wrap_plots(plot_list[13:18], ncol = 2)
+big_plot4 <- wrap_plots(plot_list[19:24], ncol = 2)
+big_plot5 <- wrap_plots(plot_list[25:30], ncol = 2)
+big_plot6 <- wrap_plots(plot_list[30:35], ncol = 2)
+big_plot7 <- wrap_plots(plot_list[35:41], ncol = 2)
+
+# Display it
+big_plot1
+big_plot2
+big_plot3
+big_plot4
+big_plot5
+big_plot6
+big_plot7
+```
+# plot direct replication variables
+```{r}
+codes_plot <- sig_dirrep %>% dplyr::select(`Dependent variable`, variable, `Segmentation Method`)
+codes_plot <- codes_plot %>% mutate(DV = paste(`Dependent variable`))
+codes_plot <- distinct(codes_plot)
+codes_plot$variable <- gsub(" ", "", codes_plot$variable)
+plot_list <- list()
+for (i in seq_len(nrow(codes_plot))) {
+  var <- codes_plot$variable[i]
+  label <- codes_plot$DV[i]
+
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+
+
+  # Long-format raw data
+  long_data <- data_all %>%
+    dplyr::select(Participants.ID, CovidGroup, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3"))
+
+  long_data$instance <- factor(long_data$instance, levels = c("i2", "i3"))
+  long_data$CovidGroup <- factor(long_data$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+
+  # calculate the summary means
+
+  dfwc <- summarySEwithin(long_data, measurevar = "score", withinvars = "instance", betweenvars = "CovidGroup", idvar = "Participants.ID", na.rm = TRUE, conf.interval = .95)
+
+  dfwc$CovidGroup <- factor(dfwc$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+  # Plot: Boxplot + Adjusted Means + Error Bars
+  p <- ggplot() +
+    geom_boxplot(
+      data = long_data,
+      aes(x = instance, y = score, fill = CovidGroup),
+      position = position_dodge(width = 0.75)
+    ) +
+    theme_bw() +
+    labs(title = label, y = "IDP value", x = "instance") +
+    theme_cowplot(12) +
+    theme(
+      plot.title = element_blank(),
+      axis.title = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 19),
+      axis.text.y = element_text(size = 19),
+      legend.title = element_text(size = 18, face = "bold"),
+      legend.text = element_text(size = 17),
+      strip.text = element_text(size = 18)
+    ) +
+    scale_x_discrete(labels = c("T1", "T2")) +
+    scale_fill_manual(
+      values = c("#E69F00", "#999999", "#56B4E9"),
+      labels = c("Covid", "Control 1", "Control 2"), name = "Group"
+    )
+
+  print(p)
+  plot_list[[label]] <- p
+}
+```
+
+# boxplot strucMRI variables
+```{r}
+codes_plot <- sig_MRI %>% dplyr::select(`Dependent variable`, variable, `Segmentation Method`)
+codes_plot <- codes_plot %>% mutate(DV = paste(`Dependent variable`))
+codes_plot <- distinct(codes_plot)
+codes_plot$variable <- gsub(" ", "", codes_plot$variable)
+plot_list <- list()
+for (i in seq_len(nrow(codes_plot))) {
+  var <- codes_plot$variable[i]
+  label <- codes_plot$DV[i]
+
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+
+
+  # Long-format raw data
+  long_data <- data_all %>%
+    dplyr::select(Participants.ID, CovidGroup, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3"))
+
+  long_data$instance <- factor(long_data$instance, levels = c("i2", "i3"))
+  long_data$CovidGroup <- factor(long_data$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+
+  # calculate the summary means
+
+  dfwc <- summarySEwithin(long_data, measurevar = "score", withinvars = "instance", betweenvars = "CovidGroup", idvar = "Participants.ID", na.rm = TRUE, conf.interval = .95)
+
+  dfwc$CovidGroup <- factor(dfwc$CovidGroup, levels = c("Covid", "Control1", "Control2"))
+  # Plot: Boxplot + Adjusted Means + Error Bars
+  p <- ggplot() +
+    geom_boxplot(
+      data = long_data,
+      aes(x = instance, y = score, fill = CovidGroup),
+      position = position_dodge(width = 0.75)
+    ) +
+    theme_bw() +
+    labs(title = label, y = "IDP value", x = "instance") +
+    theme_cowplot(12) +
+    theme(
+      plot.title = element_blank(),
+      axis.title = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 19),
+      axis.text.y = element_text(size = 19),
+      legend.title = element_text(size = 18, face = "bold"),
+      legend.text = element_text(size = 17),
+      strip.text = element_text(size = 18)
+    ) +
+    scale_x_discrete(labels = c("T1", "T2")) +
+    scale_fill_manual(
+      values = c("#E69F00", "#999999", "#56B4E9"),
+      labels = c("Covid", "Control 1", "Control 2")
+    )
+
+  print(p)
+  plot_list[[label]] <- p
+}
+```
+
+# csv with all results for sup mat
+```{r}
+all_res_img
+# preparing codes for collating
+codes_dirrep <- codes %>%
+  dplyr::select(`Dependent variable`, `Segmentation Method`, IDs) %>%
+  mutate(DV = paste(`Dependent variable`, `Segmentation Method`, sep = " | "))
+codes_dirrep <- codes_dirrep %>% dplyr::select(DV, IDs)
+colnames(codes_dirrep) <- c("DV", "variable")
+codes_dirrep$analysis <- "Direct replication"
+
+codesMRI <- codesMRI %>% mutate(DV = paste(`Dependent variable`, `Segmentation Method`, `side`, sep = " | "))
+codesMRI <- codesMRI %>% dplyr::select(DV, variable)
+codesMRI$analysis <- "Conceptual replication"
+
+codesdMRI <- codesdMRI %>% mutate(measure_type = ifelse(str_starts(measure, "Mean FA"), "FA", "MD"))
+codesdMRI <- codesdMRI %>% mutate(DV = paste(`Dependent variable`, side, measure_type, sep = " | "))
+codesdMRI <- codesdMRI %>% dplyr::select(DV, variable)
+codesdMRI$analysis <- "Conceptual replication"
+
+codes_all <- rbind(codes_dirrep, codesMRI, codesdMRI)
+codes_all$variable <- gsub(" ", "", codes_all$variable)
+codes_all$DV[46] <- gsub(" \\| Left \\| ", " | ", codes_all$DV[46])
+codes_all$DV[48] <- gsub(" \\| Left \\| ", " | ", codes_all$DV[48])
+codes_all$DV[74] <- gsub(" \\| Left \\| ", " | ", codes_all$DV[74])
+codes_all$DV[76] <- gsub(" \\| Left \\| ", " | ", codes_all$DV[76])
+codes_all$DV[90] <- gsub(" \\| Left \\| ", " | ", codes_all$DV[90])
+codes_all$DV[92] <- gsub(" \\| Left \\| ", " | ", codes_all$DV[92])
+codes_all$DV[36] <- sub(" \\| Left$", "", codes_all$DV[36])
+all_res_img <- merge(all_res_img, codes_all, by = "variable")
+calc <- all_res_img %>%
+  filter(p_fdr <= 0.05) %>%
+  select(DV, term, estimate, p_fdr) %>%
+  filter(term == "CovidGroupControl1:instancei3")
+table(calc$term)
+summary(abs(calc$estimate))
+# write.csv(all_res_img,"IMG_allResults.csv")
+```
+
+# checking on a variable for which the plot seems to not have one group, but the trajectories are just perfectly overlapping so one is not visible
+```{r}
+ggplot(data_all, aes(x = p25119_i3, fill = CovidGroup)) +
+  geom_histogram()
+
+
+cb_data <- data_all %>%
+  pivot_longer(cols = c("p25119_i2", "p25119_i3"), names_to = "instance", values_to = "score", values_drop_na = TRUE)
+cb_data$instance <- as.factor(cb_data$instance)
+dfwc_cb <- summarySEwithin(cb_data,
+  measurevar = "score", withinvars = "instance", betweenvars = "CovidGroup",
+  idvar = "Participants.ID", na.rm = TRUE, conf.interval = .95
+)
+
+ggplot(dfwc_cb, aes(x = instance, y = score, group = CovidGroup, color = CovidGroup)) +
+  geom_point(size = 4) +
+  geom_point(data = cb_data, aes(group = Participants.ID), size = 1, alpha = 0.05) +
+  geom_line(data = cb_data, aes(group = Participants.ID), alpha = 0.05) +
+  geom_line(aes(group = CovidGroup), size = 2) +
+  geom_errorbar(aes(ymin = score - se, ymax = score + se), width = .1, size = 2) +
+  labs(title = "Mean scores for instance with error bars", y = "IDP score", x = "instance") +
+  theme_cowplot(12) +
+  theme(plot.title = element_blank(), axis.title = element_text(size = 18, face = "bold"), axis.text.x = element_text(size = 17), axis.text.y = element_text(size = 17)) +
+  scale_x_discrete(labels = c("T1", "T2")) +
+  scale_color_manual(values = cbPalette)
+```
+
+# Vaccination analysis
+```{r}
+# the vaccination subset created as part of the cognitive analysis
+head(df_inf)
+nrow(df_inf)
+# need to add imaging data
+data_vacc_img <- merge(df_inf, data_all, by = "Participants.ID")
+nrow(data_vacc_img)
+```
+# Model for analysing the vaccination data
+```{r}
+data_vacc_img$vaccinated <- factor(data_vacc_img$vaccinated, levels = c("vacc", "nonvacc"))
+results_list <- list()
+model_objects <- list()
+
+for (var in common_roots) {
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+  # Skip if one of the time points is missing
+  if (!all(c(col_i2, col_i3) %in% names(data_vacc_img))) next
+  print(var)
+  # scale
+  data_vacc_img[[col_i2]] <- scale(data_vacc_img[[col_i2]], center = TRUE, scale = TRUE)
+  data_vacc_img[[col_i3]] <- scale(data_vacc_img[[col_i3]], center = TRUE, scale = TRUE)
+  # Pivot just the two time points to long
+  long_df <- data_vacc_img %>%
+    dplyr::select(Participants.ID, Site2, vaccinated, Month_dif, Month_dif_sq, Age2_sc, Sex, Town_sc, Ethnic2, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3")) # Ensures treatment contrast works
+
+  # Fit model
+  model <- lmer(
+    score ~ vaccinated + instance + vaccinated:instance +
+      Month_dif + Month_dif_sq + Age2_sc + Sex + Town_sc + Ethnic2 +
+      (1 | Participants.ID) + (1 | Site2),
+    data = long_df
+  )
+
+  # Store tidy results with variable name
+  model_objects[[var]] <- model
+  tidy_res <- broom.mixed::tidy(model, effects = "fixed") %>%
+    mutate(variable = var)
+
+  results_list[[var]] <- tidy_res
+  plot(resid(model))
+}
+```
+# rerun without second random intercept for variables with convergence issues
+```{r}
+add_var <- c("p26585", "p25386", "p26516", "p26515", "p26780", "p26520", "p25888", "p25889", "p25848", "p25838", "p25839", "p25840", "p25846", "p25847", "p25798", "p25799", "p25021", "p25019", "p26518", "p25119", "p25111", "p25110", "p25143", "p25147", "p25146", "p25145", "p25092", "p25062", "p25088", "p25094", "p25085", "p25084", "p25060", "p25100")
+
+results_list2 <- list()
+model_objects2 <- list()
+
+for (var in add_var) {
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+  # Skip if one of the time points is missing
+  if (!all(c(col_i2, col_i3) %in% names(data_vacc_img))) next
+  print(var)
+  # scale
+  data_vacc_img[[col_i2]] <- scale(data_vacc_img[[col_i2]], center = TRUE, scale = TRUE)
+  data_vacc_img[[col_i3]] <- scale(data_vacc_img[[col_i3]], center = TRUE, scale = TRUE)
+  # Pivot just the two time points to long
+  long_df <- data_vacc_img %>%
+    dplyr::select(Participants.ID, Site2, vaccinated, Month_dif, Month_dif_sq, Age2_sc, Sex, Town_sc, Ethnic2, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3")) # Ensures treatment contrast works
+
+  # Fit model
+  model <- lmer(
+    score ~ vaccinated + instance + vaccinated:instance +
+      Month_dif + Month_dif_sq + Age2_sc + Sex + Town_sc + Ethnic2 +
+      (1 | Participants.ID),
+    data = long_df
+  )
+
+  # Store tidy results with variable name
+  model_objects2[[var]] <- model
+  tidy_res <- broom.mixed::tidy(model, effects = "fixed") %>%
+    mutate(variable = var)
+
+  results_list2[[var]] <- tidy_res
+  plot(resid(model))
+}
+```
+# put both together
+```{r}
+# need to remove results for models that are in results_list2 from results list
+results_vacc <- results_list[setdiff(names(results_list), names(results_list2))]
+
+
+results_vacc <- append(results_vacc, results_list2)
+results_vacc <- bind_rows(results_vacc)
+
+
+results_vacc <- merge(results_vacc, codes_all, by = "variable")
+
+write.csv(results_vacc, "results_img_vaccination.csv")
+```
+#correction for multiple comparisons
+```{r}
+# Apply p.adjust
+pval_img_fdr_vacc <- results_vacc %>%
+  mutate(p_fdr = p.adjust(p.value, method = "fdr")) %>%
+  ungroup()
+
+
+# which p-values remain significant
+img_sig_vacc <- pval_img_fdr_vacc %>% filter(p_fdr <= 0.05)
+
+
+pval_img_fdr_vacc <- merge(pval_img_fdr_vacc, codes_all, by = "variable")
+
+# write.csv(pval_img_fdr_vacc, "results_img_vaccination.csv")
+```
+# plot
+```{r}
+plot_list <- list()
+codes_vacc <- unique(pval_img_fdr_vacc$variable)
+for (var in codes_vacc) {
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+  long_data <- data_vacc_img %>%
+    select(Participants.ID, vaccinated, all_of(c(col_i2, col_i3))) %>%
+    pivot_longer(
+      cols = c(all_of(col_i2), all_of(col_i3)),
+      names_to = "instance", values_to = "score"
+    ) %>%
+    mutate(instance = if_else(str_ends(instance, "_i2"), "i2", "i3"))
+
+  long_data$instance <- as.factor(long_data$instance)
+  dfwc <- summarySEwithin(long_data, measurevar = "score", withinvars = "instance", betweenvars = "vaccinated", idvar = "Participants.ID", na.rm = TRUE, conf.interval = .95)
+
+  p <- ggplot(dfwc, aes(x = instance, y = score, group = vaccinated, color = vaccinated)) +
+    geom_point(size = 4) +
+    geom_line(size = 2) +
+    geom_errorbar(aes(ymin = score - se, ymax = score + se), width = .1, size = 2) +
+    theme_bw() +
+    labs(title = label, y = "IDP value", x = "instance") +
+    theme_cowplot(12) +
+    theme(
+      plot.title = element_text(size = 18, face = "bold"),
+      axis.title = element_text(size = 20, face = "bold"),
+      axis.text.x = element_text(size = 19),
+      axis.text.y = element_text(size = 19),
+      legend.title = element_text(size = 18, face = "bold"),
+      legend.text = element_text(size = 17),
+      strip.text = element_text(size = 18)
+    ) +
+    scale_x_discrete(labels = c("T1", "T2")) +
+    scale_color_manual(values = c("#F0E442", "#0072B2"))
+
+  print(p)
+  plot_list[[var]] <- p
+}
+
+
+plot_list
+```
+
+# Non-preregistered analyses: Time since infection
+```{r}
+# need to add imaging data
+data_TSI <- merge(Vacc_data, data_all, by = "Participants.ID")
+nrow(data_TSI)
+
+# filter for only infections happening before 2nd instance
+data_TSI <- data_TSI %>% filter(Date_positive < Date_assess2)
+data_TSI$TimeSInf <- difftime(data_TSI$Date_assess2, data_TSI$Date_positive, units = "days")
+
+# only latest date per participant
+data_TSI <- data_TSI %>%
+  dplyr::group_by(Participants.ID) %>%
+  slice_max(order_by = Date_positive, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# time since inf as numeric
+data_TSI$TimeSInf <- as.numeric(data_TSI$TimeSInf)
+hist(data_TSI$TimeSInf)
+summary(data_TSI$TimeSInf)
+data_TSI$TSI_sc <- scale(data_TSI$TimeSInf, scale = TRUE, center = TRUE)
+summary(data_TSI$TSI_sc)
+```
+
+
+# regression model for time since infection
+
+```{r}
+results_list <- list()
+model_objects <- list()
+
+for (var in common_roots) {
+  col_i2 <- paste0(var, "_i2")
+  col_i3 <- paste0(var, "_i3")
+  # Skip if one of the time points is missing
+  if (!all(c(col_i2, col_i3) %in% names(data_vacc_img))) next
+  print(var)
+  # scale
+  data_TSI[[col_i2]] <- scale(data_TSI[[col_i2]], center = TRUE, scale = TRUE)
+  data_TSI[[col_i3]] <- scale(data_TSI[[col_i3]], center = TRUE, scale = TRUE)
+
+  # Build formula
+  formula_str <- paste(
+    col_i3, "~", col_i2,
+    "+ TSI_sc + Month_dif + Month_dif_sq + Age2_sc + Sex + Town_sc + Ethnic2"
+  )
+  model_formula <- as.formula(formula_str)
+
+  # Fit model
+  model <- lm(model_formula, data = data_TSI)
+
+  # Store model and tidy results
+  model_objects[[var]] <- model
+  tidy_res <- broom::tidy(model) %>% mutate(variable = var)
+  results_list[[var]] <- tidy_res
+
+  # Plot residuals
+  plot(resid(model), main = paste("Residuals for", var))
+}
+results_list
+TSI_models_img <- bind_rows(results_list)
+```
+
+# correction for multiple comparisons
+```{r}
+TSI_models_img %>%
+  filter(p.value <= 0.05) %>%
+  filter(term == "TSI_sc")
+
+# Apply p.adjust
+results_TSI <- TSI_models_img %>%
+  mutate(p_fdr = p.adjust(p.value, method = "fdr")) %>%
+  ungroup()
+
+
+results_TSI <- merge(results_TSI, codes_all, by = "variable")
+# write.csv(results_TSI, "time_since_inf_img.csv")
+
+sig_resTSI <- results_TSI %>%
+  filter(p_fdr <= 0.05) %>%
+  filter(term == "TSI_sc") %>%
+  dplyr::select("DV", "estimate", "std.error", "p_fdr")
+# write.csv(sig_resTSI,"sig_res_TSI.csv")
+results_TSI %>%
+  filter(p_fdr <= 0.05) %>%
+  dplyr::select("DV", "term", "estimate", "std.error", "p_fdr", "variable")
+```
+
+
+
+# plots of size and direction of beta estimates for results
+```{r}
+plot_dir <- all_res_img %>%
+  filter(analysis == "Direct replication") %>%
+  filter(term == "CovidGroupControl1:instancei3" | term == "CovidGroupControl2:instancei3")
+
+# direct replication
+plot_dir <- plot_dir %>% mutate(ns = p_fdr > 0.05) # TRUE if non-sig
+
+ggplot(plot_dir, aes(x = estimate, y = DV, fill = term, alpha = ns)) +
+  geom_col(position = "dodge") +
+  geom_vline(xintercept = 0.1, linetype = 2) +
+  geom_vline(xintercept = -0.1, linetype = 2) +
+  scale_alpha_manual(values = c(`TRUE` = 0.35, `FALSE` = 1), guide = "none") +
+  theme_cowplot(12) +
+  scale_fill_manual(
+    values = c("#999999", "#56B4E9"),
+    labels = c("Control 1", "Control 2"), name = "Interaction with:"
+  ) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),
+    axis.text.x = element_text(size = 19),
+    axis.text.y = element_text(size = 18),
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text = element_text(size = 17),
+    strip.text = element_text(size = 18),
+    legend.position = "bottom"
+  )
+
+# subset for conceptual replication
+plot_con <- all_res_img %>%
+  filter(analysis == "Conceptual replication") %>%
+  filter(term == "CovidGroupControl1:instancei3" | term == "CovidGroupControl2:instancei3")
+plot_con <- plot_con %>%
+  mutate(
+    group = case_when(
+      grepl("FA$", DV) ~ "FA", # DV ends with FA
+      grepl("MD$", DV) ~ "MD", # DV ends with MD
+      TRUE ~ "MRI" # otherwise
+    )
+  )
+# sMRI
+plot_con <- plot_con %>% mutate(ns = p_fdr > 0.05)
+plot_con1 <- plot_con %>% filter(group == "MRI")
+ggplot(plot_con1, aes(x = estimate, y = DV, fill = term, alpha = ns)) +
+  geom_col(position = "dodge") +
+  geom_vline(xintercept = 0.1, linetype = 2) +
+  geom_vline(xintercept = -0.1, linetype = 2) +
+  scale_alpha_manual(values = c(`TRUE` = 0.35, `FALSE` = 1), guide = "none") +
+  theme_cowplot(12) +
+  scale_fill_manual(
+    values = c("#999999", "#56B4E9"),
+    labels = c("Control 1", "Control 2"), name = "Interaction with:"
+  ) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),
+    axis.text.x = element_text(size = 19),
+    axis.text.y = element_text(size = 18),
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text = element_text(size = 17),
+    strip.text = element_text(size = 18),
+    legend.position = "bottom"
+  )
+# MD
+plot_con2 <- plot_con %>% filter(group == "MD")
+ggplot(plot_con2, aes(x = estimate, y = DV, fill = term, alpha = ns)) +
+  geom_col(position = "dodge") +
+  geom_vline(xintercept = 0.1, linetype = 2) +
+  geom_vline(xintercept = -0.1, linetype = 2) +
+  scale_alpha_manual(values = c(`TRUE` = 0.35, `FALSE` = 1), guide = "none") +
+  theme_cowplot(12) +
+  scale_fill_manual(
+    values = c("#999999", "#56B4E9"),
+    labels = c("Control 1", "Control 2"), name = "Interaction with:"
+  ) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),
+    axis.text.x = element_text(size = 19),
+    axis.text.y = element_text(size = 18),
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text = element_text(size = 17),
+    strip.text = element_text(size = 18),
+    legend.position = "bottom"
+  )
+# FA
+plot_con3 <- plot_con %>% filter(group == "FA")
+ggplot(plot_con3, aes(x = estimate, y = DV, fill = term, alpha = ns)) +
+  geom_col(position = "dodge") +
+  geom_vline(xintercept = 0.1, linetype = 2) +
+  geom_vline(xintercept = -0.1, linetype = 2) +
+  scale_alpha_manual(values = c(`TRUE` = 0.35, `FALSE` = 1), guide = "none") +
+  theme_cowplot(12) +
+  scale_fill_manual(
+    values = c("#999999", "#56B4E9"),
+    labels = c("Control 1", "Control 2"), name = "Interaction with:"
+  ) +
+  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),
+    axis.text.x = element_text(size = 19),
+    axis.text.y = element_text(size = 18),
+    legend.title = element_text(size = 18, face = "bold"),
+    legend.text = element_text(size = 17),
+    strip.text = element_text(size = 18),
+    legend.position = "bottom"
+  )
+```

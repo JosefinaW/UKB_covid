@@ -1,0 +1,408 @@
+---
+title: "CCA_analysis"
+author: "JW"
+date: "2025-05-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# packages loading
+```{r, echo=FALSE,message=FALSE,warning=FALSE,results=FALSE} 
+if (!require(pacman)) install.packages("pacman")
+
+pacman::p_load(knitr, ggpubr, nortest, phia, lubridate, parameters, rlang, ggplot2, tidyverse, data.table, rmarkdown, GGally, tidyr, ggrepel, gridExtra, lme4, lmerTest, Rmisc, plotrix, datawizard, cowplot, emmeans, broom.mixed, easystats,acca,CCP,missMethods,scales)
+``` 
+# colour palette
+```{r,results=FALSE}
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+# # To use for fills, add
+#   scale_fill_manual(values=cbPalette)
+#
+# # To use for line and point colors, add
+#   scale_colour_manual(values=cbPalette)
+```
+#data preparation for the CCA
+```{r}
+colnames(data_all)
+cca_cogdata <- data_all %>% dplyr::select("Participants.ID", "FluidInt1","FluidInt2","RT1","RT2","TMTA1","TMTA2","TMTB1","TMTB2","SymbolDigSub1","SymbolDigSub2","Vocab1","Vocab2","AM1","AM2","MatrixTest1","MatrixTest2","MatPatternT1","MatPatternT2")
+cca_imgdata <- data_all[,c(1,59:270)]
+
+
+
+#is there more than 50% missing values per category for a participant?
+nrow(cca_imgdata)
+ncol(cca_imgdata)
+na_count_per_row <- apply(cca_imgdata, 1, function(x) sum(is.na(x)))
+summary(na_count_per_row)
+
+data_img
+cca_imgdata$NA_count <- na_count_per_row/212
+cca_imgdata <- cca_imgdata %>% filter(NA_count<=0.5)
+nrow(cca_imgdata)
+#for cog data
+na_count_per_row2 <- apply(cca_cogdata, 1, function(x) sum(is.na(x)))
+summary(na_count_per_row2)
+cca_cogdata$NA_count <- na_count_per_row2/19 #need to change this value when adding the missing cols
+cca_cogdata <- cca_cogdata %>% filter(NA_count<=0.5)
+
+```
+
+```{r}
+#removing participants missing in each
+df_cca<-merge(cca_cogdata,cca_imgdata,by="Participants.ID")
+nrow(df_cca)
+#missing values in rows
+rows_with_na <- apply(df_cca, 1, function(x) any(is.na(x)))
+table(rows_with_na) #overall more than 15% participants has NA values
+#missing values in columns
+na_count_per_col <- apply(df_cca, 2, function(x) sum(is.na(x)))
+summary(na_count_per_col) # is not more than 50% for a variable
+df_z <- df_cca  # a copy for scaling
+df_z[, -1] <- scale(df_z[, -1]) #all columns scaled
+
+```
+# creating diffs columns
+```{r}
+all_cols <- names(df_z)[-1]  # exclude ID column
+
+# Initialize list to store difference columns
+diff_list <- list()
+
+# Loop through time1 columns
+for (col_t1 in all_cols) {
+  # Detect if it's time1 by "_i2" or ending in "1"
+  if (grepl("_i2$", col_t1)) {
+    col_t2 <- sub("_i2$", "_i3", col_t1)  # construct time2 name
+  } else if (grepl("1$", col_t1)) {
+    col_t2 <- sub("1$", "2", col_t1)
+  } else {
+    next  # skip columns that aren't time1
+  }
+
+  # Only proceed if time2 column exists
+  if (col_t2 %in% all_cols) {
+    # Create a name for the difference column
+    diff_name <- paste0(col_t1, "_diff")
+    # Calculate difference and store in list
+    diff_list[[diff_name]] <- df_z[[col_t2]] - df_z[[col_t1]]
+  }
+}
+
+df_diff <- cbind(df_z, as.data.frame(diff_list))
+head(df_diff)
+colnames(df_diff)
+df_diff <- df_diff[,c(1,234:344)]
+#imputation of median for remaining missing values
+
+df_diff <- impute_median(df_diff,type = "columnwise")
+#storing IDs
+IDS <- df_diff$Participants.ID
+#creating two df for cognitive and imaging data
+df_diff_cog <- df_diff[,2:10]
+df_diff_img <- df_diff[,c(11:112)]
+summary(df_diff)
+nrow(df_diff)
+```
+# CCA analysis
+```{r}
+set.seed(123)
+# Fit CCA
+fit <- acca::cc(X = df_diff_cog, Y = df_diff_img)
+
+# Permutation 
+out <- acca::cc_inference(fit, B=1000, resamp_type="permutation",light=TRUE)
+
+out
+
+out$p_values
+# variation explained by the overall result
+
+p.perm(X = df_diff_cog, Y = df_diff_img,nboot=1000,rhostart = 1,type = "Wilks")
+
+```
+# create scree plot of squared canonical correlations
+
+```{r}
+scree <- data.frame(
+  dim   = seq_along(fit$cor),
+  rho   = as.numeric(fit$cor)
+)
+scree <- subset(scree, !is.na(rho))     
+scree$rho2   <- scree$rho^2
+ggplot(scree, aes(x = dim, y = rho2)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = scree$dim) +
+  labs(x = "Canonical dimension", y = "% of variance",
+       title = "CCA scree (squared canonical correlations)") +
+  theme_cowplot(12)+theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),     
+    axis.text.x = element_text(size = 19),                   
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"),   
+    legend.text = element_text(size = 17),                   
+    strip.text = element_text(size = 18)                    
+  ) 
+
+
+```
+# canonical scores
+```{r}
+# Get canonical scores for each participant for the first canonical correlation
+CV1_cog <- out$scores$xscores[, 1]   
+CV1_img <- out$scores$yscores[, 1]
+#create a df with IDs
+canonical_df <- data.frame(
+  Participants.ID = IDS,                     
+  Cognitive_CV1   = as.numeric(CV1_cog),
+  Imaging_CV1     = as.numeric(CV1_img)
+)
+
+```
+
+# joining df together with other predictors
+```{r}
+predictors <- data_all%>%dplyr::select("Participants.ID", "CovidGroup", "Month_dif","Month_dif_sq", "Age2_sc","Town_sc", "Ethnic2","Sex","Age2")
+canonical_df <- merge(canonical_df,predictors,by="Participants.ID")
+
+canonical_df%>%filter(CovidGroup=="Control2") %>% summary
+
+```
+# second level GLM 
+```{r}
+# set up correct order for contrasts
+canonical_df$CovidGroup <- factor(canonical_df$CovidGroup, levels = c("Covid","Control2", "Control1"))
+contrasts(canonical_df$CovidGroup)
+cca_model1 <- lm(Cognitive_CV1 ~ CovidGroup*Imaging_CV1+Month_dif+Month_dif_sq+Age2_sc+Ethnic2+Sex+Town_sc,data=canonical_df)
+summary(cca_model1)
+plot(resid(cca_model1))
+#model
+cca_model2 <- lm(Imaging_CV1 ~ CovidGroup*Cognitive_CV1+Month_dif+Month_dif_sq+Age2_sc+Ethnic2+Sex+Town_sc,data=canonical_df)
+summary(cca_model2)
+plot(resid(cca_model2))
+
+
+```
+#explorative - age model
+```{r}
+age_model1 <- lm(Cognitive_CV1 ~ Imaging_CV1*Age2_sc+Month_dif+Month_dif_sq+Ethnic2+Sex+Town_sc,data=canonical_df)
+summary(age_model1)
+plot(resid(age_model1))
+standardise_parameters(age_model1)
+
+```
+
+#calculate structure coefficients
+```{r}
+X_data <- out$data$X
+xscores <- out$scores$xscores
+Sx <- cor(X_data,xscores)
+# Turn Sx (matrix) into a data frame for ggplot
+df_plot <- data.frame(
+  Variable = rownames(Sx),
+  Loading  = Sx[, 1]   # first canonical mode
+)
+df_plot
+# Optional: order bars by loading
+df_plot$Variable <- factor(df_plot$Variable,
+                           levels = df_plot$Variable[order(df_plot$Loading)])
+Cog_names <- c("Fluid Intelligence", "Reaction time","TMT A","TMT B", "Symbol digit substitution","Picture vocabulary test","Paired associate learning","Matrix pattern number completed", "Matrix pattern RT")
+df_plot <- cbind(df_plot,Cog_names)
+# Plot
+ggplot(df_plot, aes(x = reorder(Cog_names,Loading), y = Loading)) +
+  geom_col(fill = "#CC79A7") +
+  coord_flip() + geom_hline(yintercept = 0.2, linetype = 2) +
+geom_hline(yintercept = -0.2, linetype = 2) +
+  labs(title = "Structure Coefficients (Mode 1, X set)",
+       y = "Structure coefficient", x = "") +
+  theme_cowplot(12) +theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),     
+    axis.text.x = element_text(size = 19),                   
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"),   
+    legend.text = element_text(size = 17),                   
+    strip.text = element_text(size = 18)                    
+  ) 
+
+
+#For Y data
+Y_data <- out$data$Y
+yscores <- out$scores$yscores
+Sy <- cor(Y_data,yscores)
+# Turn Sx (matrix) into a data frame for ggplot
+df_plot2 <- data.frame(
+  Variable = rownames(Sy),
+  Loading  = Sy[, 1]   # first canonical mode
+)
+
+# Optional: order bars by loading
+df_plot2$Variable <- factor(df_plot2$Variable,
+                           levels = df_plot2$Variable[order(df_plot2$Loading)])
+
+df_plot2 <- df_plot2 %>% mutate(Key = sub("_.*", "", Variable))
+df_plot2 <- merge(df_plot2, codes_all, by.x="Key",by.y="variable")
+
+df_plot2 <- df_plot2 %>%
+  mutate(
+    group = case_when(
+      grepl("FA$", DV) ~ "FA",            # DV ends with FA
+      grepl("MD$", DV) ~ "MD",            # DV ends with MD
+      grepl("^Direct", analysis) ~ "Direct",  # analysis starts with Direct
+      TRUE ~ "MRI"                        # otherwise
+    )
+  )
+nrow(df_plot2)
+# Plot overall
+ggplot(df_plot2, aes(x = reorder(DV, Loading), y = Loading,fill=group)) +
+  geom_col() +
+  coord_flip() + geom_hline(yintercept = 0.2, linetype = 2) +
+geom_hline(yintercept = -0.2, linetype = 2) +
+  labs(title = "Structure Coefficients (Mode 1, Y set)",
+       y = "Structure coefficient", x = "") +
+  theme_cowplot(12) + scale_fill_manual(values=c("#009E73","#F0E442","#0072B2","#D55E00"), name = "IDP group",labels = c("Direct replication","Mean FA","Mean MD","structural MRI")) +theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),     
+    axis.text.x = element_text(size = 19),                   
+    axis.text.y = element_blank(),
+    legend.title = element_text(size = 18, face = "bold"),   
+    legend.text = element_text(size = 17),                   
+    strip.text = element_text(size = 18)                    
+  ) 
+
+#plot subgroups
+cca_plotFA <- df_plot2 %>% filter(group=="FA")
+
+ggplot(cca_plotFA, aes(x = reorder(DV, Loading), y = Loading)) +
+  geom_col(fill="#F0E442") +
+  coord_flip() + geom_hline(yintercept = 0.2, linetype = 2) +
+geom_hline(yintercept = -0.2, linetype = 2) +
+  labs(title = "Structure Coefficients (Mode 1)",
+       y = "Structure coefficient", x = "") +
+  theme_cowplot(12) +theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),     
+    axis.text.x = element_text(size = 19),                   
+    axis.text.y = element_text(size=18),
+    legend.title = element_text(size = 18, face = "bold"),   
+    legend.text = element_text(size = 17),                   
+    strip.text = element_text(size = 18)                    
+  ) 
+
+cca_plotMD <- df_plot2 %>% filter(group=="MD")
+ggplot(cca_plotMD, aes(x = reorder(DV, Loading), y = Loading)) +
+  geom_col(fill="#0072B2") +
+  coord_flip() +geom_hline(yintercept = 0.2, linetype = 2) +
+geom_hline(yintercept = -0.2, linetype = 2) +
+  labs(title = "Structure Coefficients (Mode 1, X set)",
+       y = "Structure coefficient", x = "") +
+  theme_cowplot(12) +theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),     
+    axis.text.x = element_text(size = 19),                   
+    axis.text.y = element_text(size=18),
+    legend.title = element_text(size = 18, face = "bold"),   
+    legend.text = element_text(size = 17),                   
+    strip.text = element_text(size = 18)                    
+  ) 
+
+cca_plotDir <- df_plot2 %>% filter(group=="Direct")
+ggplot(cca_plotDir, aes(x = reorder(DV, Loading), y = Loading)) +
+  geom_col(fill="#009E73") +
+  coord_flip() + geom_hline(yintercept = 0.2, linetype = 2) +
+geom_hline(yintercept = -0.2, linetype = 2) +
+  labs(title = "Structure Coefficients (Mode 1, X set)",
+       y = "Structure coefficient", x = "") +
+  theme_cowplot(12) +theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),     
+    axis.text.x = element_text(size = 19),                   
+    axis.text.y = element_text(size=18),
+    legend.title = element_text(size = 18, face = "bold"),   
+    legend.text = element_text(size = 17),                   
+    strip.text = element_text(size = 18)                    
+  ) 
+
+cca_plotMRI <- df_plot2 %>% filter(group=="MRI")
+ggplot(cca_plotMRI, aes(x = reorder(DV, Loading), y = Loading)) +
+  geom_col(fill="#D55E00") +
+  coord_flip() +geom_hline(yintercept = 0.2, linetype = 2) +
+geom_hline(yintercept = -0.2, linetype = 2) +
+  labs(title = "Structure Coefficients (Mode 1, X set)",
+       y = "Structure coefficient", x = "") +
+  theme_cowplot(12) +theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),     
+    axis.text.x = element_text(size = 19),                   
+    axis.text.y = element_text(size=18),
+    legend.title = element_text(size = 18, face = "bold"),   
+    legend.text = element_text(size = 17),                   
+    strip.text = element_text(size = 18)                    
+  ) 
+```
+# bivariate correlation plot
+```{r}
+
+canonical_df$CovidGroup <- factor(canonical_df$CovidGroup, levels = c("Covid", "Control1","Control2"))
+ggplot(canonical_df, aes(x = Imaging_CV1, y = Cognitive_CV1, color = CovidGroup)) +
+  geom_point(alpha = 1, shape=1) +
+  geom_smooth(method = "lm", se = FALSE) +
+  theme_minimal() + labs(y="Cognitive profile", x="Imaging profile") + theme_cowplot(12) +  theme(
+    plot.title = element_blank(),
+    axis.title = element_text(size = 20, face = "bold"),     
+    axis.text.x = element_text(size = 19),                   
+    axis.text.y = element_text(size = 19),
+    legend.title = element_text(size = 18, face = "bold"),   
+    legend.text = element_text(size = 17),                   
+    strip.text = element_text(size = 18)                    
+  )  +scale_color_manual(values = c("#E69F00","#999999","#56B4E9"), labels = c( "Covid", "Control1","Control2"))
+
+
+```
+# bivariate plot for age
+
+```{r}
+# Age bands
+canonical_df <- canonical_df %>%
+  mutate(Age_band = cut(Age2, breaks = c(49,60,70,82), include.lowest = TRUE))
+
+ggplot(canonical_df, aes(x = Imaging_CV1, y = Cognitive_CV1, color = Age2)) +
+  geom_point(alpha = 1, shape = 1) +
+
+  # one smooth per band with manual colors - different shades
+  geom_smooth(
+    data = subset(canonical_df, Age_band == levels(Age_band)[1]),
+    aes(group = Age_band), method = "lm", se = FALSE, color = "#c6dbef"
+  ) +
+  geom_smooth(
+    data = subset(canonical_df, Age_band == levels(Age_band)[2]),
+    aes(group = Age_band), method = "lm", se = FALSE, color = "#6baed6"
+  ) +
+  geom_smooth(
+    data = subset(canonical_df, Age_band == levels(Age_band)[3]),
+    aes(group = Age_band), method = "lm", se = FALSE, color = "#2171b5"
+  ) +
+
+  theme_minimal() +
+  labs(y = "Cognitive profile", x = "Imaging profile", color = "Age") +
+  scale_color_gradient(limits = c(50, 80), oob = oob_squish,
+                       low = "#deebf7", high = "#08519c") +
+  theme_cowplot(12) +
+  theme(
+    plot.title  = element_blank(),
+    axis.title  = element_text(size = 20, face = "bold"),
+    axis.text.x = element_text(size = 19),
+    axis.text.y = element_text(size = 19),
+    legend.title= element_text(size = 18, face = "bold"),
+    legend.text = element_text(size = 17),
+    strip.text  = element_text(size = 18)
+  )
+
+```
